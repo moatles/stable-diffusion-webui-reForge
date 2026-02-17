@@ -73,6 +73,8 @@ def save_files(js_data, images, do_make_zip, index):
                 for key, value in d.items():
                     setattr(self, key, value)
 
+    print(f"DEBUG js_data: '{js_data}'")
+
     data = json.loads(js_data)
     p = MyObject(data)
 

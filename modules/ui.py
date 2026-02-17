@@ -2,7 +2,7 @@ import datetime
 import mimetypes
 import os
 import sys
-from functools import reduce
+from functools import reduce, lru_cache
 import warnings
 from contextlib import ExitStack
 
@@ -10,7 +10,7 @@ import gradio as gr
 import gradio.utils
 import numpy as np
 from PIL import Image, PngImagePlugin  # noqa: F401
-from modules.call_queue import wrap_gradio_gpu_call, wrap_queued_call, wrap_gradio_call, wrap_gradio_call_no_job # noqa: F401
+from modules.call_queue import wrap_gradio_gpu_call, wrap_queued_call, wrap_gradio_call, wrap_gradio_call_no_job  # noqa: F401
 
 from modules import gradio_extensons, sd_schedulers  # noqa: F401
 from modules import sd_hijack, sd_models, script_callbacks, ui_extensions, deepbooru, extra_networks, ui_common, ui_postprocessing, progress, ui_loadsave, shared_items, ui_settings, timer, sysinfo, ui_checkpoint_merger, scripts, sd_samplers, processing, ui_extra_networks, ui_toprow, launch_utils
@@ -35,19 +35,14 @@ create_setting_component = ui_settings.create_setting_component
 warnings.filterwarnings("default" if opts.show_warnings else "ignore", category=UserWarning)
 warnings.filterwarnings("default" if opts.show_gradio_deprecation_warnings else "ignore", category=gr.deprecation.GradioDeprecationWarning)
 
-# this is a fix for Windows users. Without it, javascript files will be served with text/html content-type and the browser will not show any UI
+# Fix for Windows - ensure correct MIME types
 mimetypes.init()
 mimetypes.add_type('application/javascript', '.js')
-
-# Likewise, add explicit content-type header for certain missing image types
 mimetypes.add_type('image/webp', '.webp')
 mimetypes.add_type('image/avif', '.avif')
-
-# override potentially incorrect mimetypes
 mimetypes.add_type('text/css', '.css')
 
 if not cmd_opts.share and not cmd_opts.listen:
-    # fix gradio phoning home
     gradio.utils.version_check = lambda: None
     gradio.utils.get_local_ip_address = lambda: '127.0.0.1'
 
@@ -58,7 +53,7 @@ if cmd_opts.ngrok is not None:
         cmd_opts.ngrok,
         cmd_opts.port if cmd_opts.port is not None else 7860,
         cmd_opts.ngrok_options
-        )
+    )
 
 
 def gr_show(visible=True):
@@ -68,8 +63,7 @@ def gr_show(visible=True):
 sample_img2img = "assets/stable-samples/img2img/sketch-mountains-input.jpg"
 sample_img2img = sample_img2img if os.path.exists(sample_img2img) else None
 
-# Using constants for these since the variation selector isn't visible.
-# Important that they exactly match script.js for tooltip to work.
+# UI symbols - constants matching script.js
 random_symbol = '\U0001f3b2\ufe0f'  # 🎲️
 reuse_symbol = '\u267b\ufe0f'  # ♻️
 paste_symbol = '\u2199\ufe0f'  # ↙
@@ -78,10 +72,9 @@ save_style_symbol = '\U0001f4be'  # 💾
 apply_style_symbol = '\U0001f4cb'  # 📋
 clear_prompt_symbol = '\U0001f5d1\ufe0f'  # 🗑️
 extra_networks_symbol = '\U0001F3B4'  # 🎴
-switch_values_symbol = '\U000021C5' # ⇅
-restore_progress_symbol = '\U0001F300' # 🌀
+switch_values_symbol = '\U000021C5'  # ⇅
+restore_progress_symbol = '\U0001F300'  # 🌀
 detect_image_size_symbol = '\U0001F4D0'  # 📐
-
 
 plaintext_to_html = ui_common.plaintext_to_html
 
@@ -96,7 +89,10 @@ def calc_resolution_hires(enable, width, height, hr_scale, hr_resize_x, hr_resiz
     if not enable:
         return ""
 
-    p = processing.StableDiffusionProcessingTxt2Img(width=width, height=height, enable_hr=True, hr_scale=hr_scale, hr_resize_x=hr_resize_x, hr_resize_y=hr_resize_y)
+    p = processing.StableDiffusionProcessingTxt2Img(
+        width=width, height=height, enable_hr=True,
+        hr_scale=hr_scale, hr_resize_x=hr_resize_x, hr_resize_y=hr_resize_y
+    )
     p.calculate_target_resolution()
 
     return f"from <span class='resolution'>{p.width}x{p.height}</span> to <span class='resolution'>{p.hr_resize_x or p.hr_upscale_to_x}x{p.hr_resize_y or p.hr_upscale_to_y}</span>"
@@ -113,40 +109,55 @@ def resize_from_to_html(width, height, scale_by):
 
 
 def process_interrogate(interrogation_function, mode, ii_input_dir, ii_output_dir, *ii_singles):
+    """Process interrogation with proper resource cleanup."""
     if mode in {0, 1, 3, 4}:
         return [interrogation_function(ii_singles[mode]), None]
     elif mode == 2:
         return [interrogation_function(ii_singles[mode]["image"]), None]
     elif mode == 5:
         assert not shared.cmd_opts.hide_ui_dir_config, "Launched with --hide-ui-dir-config, batch img2img disabled"
+
         images = shared.listfiles(ii_input_dir)
         print(f"Will process {len(images)} images.")
-        if ii_output_dir != "":
+
+        if ii_output_dir:
             os.makedirs(ii_output_dir, exist_ok=True)
         else:
             ii_output_dir = ii_input_dir
 
-        for image in images:
-            img = Image.open(image)
-            filename = os.path.basename(image)
-            left, _ = os.path.splitext(filename)
-            print(interrogation_function(img), file=open(os.path.join(ii_output_dir, f"{left}.txt"), 'a', encoding='utf-8'))
+        for image_path in images:
+            # Properly open and close image
+            with Image.open(image_path) as img:
+                filename = os.path.basename(image_path)
+                left, _ = os.path.splitext(filename)
+                result = interrogation_function(img)
+
+            # Properly open and close file
+            output_path = os.path.join(ii_output_dir, f"{left}.txt")
+            with open(output_path, 'a', encoding='utf-8') as f:
+                print(result, file=f)
 
         return [gr.update(), None]
 
+    return [gr.update(), None]
+
 
 def interrogate(image):
+    if image is None:
+        return gr.update()
     prompt = shared.interrogator.interrogate(image.convert("RGB"))
     return gr.update() if prompt is None else prompt
 
 
 def interrogate_deepbooru(image):
+    if image is None:
+        return gr.update()
     prompt = deepbooru.model.tag(image)
     return gr.update() if prompt is None else prompt
 
 
 def connect_clear_prompt(button):
-    """Given clear button, prompt, and token_counter objects, setup clear prompt button click event"""
+    """Setup clear prompt button click event."""
     button.click(
         _js="clear_prompt",
         fn=None,
@@ -156,6 +167,10 @@ def connect_clear_prompt(button):
 
 
 def update_token_counter(text, steps, styles, *, is_positive=True):
+    """Update token counter display with proper error handling."""
+    if not text:
+        return "<span class='gr-box gr-text-input'>0/?</span>"
+
     params = script_callbacks.BeforeTokenCounterParams(text, steps, styles, is_positive=is_positive)
     script_callbacks.before_token_counter_callback(params)
     text = params.prompt
@@ -178,19 +193,26 @@ def update_token_counter(text, steps, styles, *, is_positive=True):
         prompt_schedules = prompt_parser.get_learned_conditioning_prompt_schedules(prompt_flat_list, steps)
 
     except Exception:
-        # a parsing error can happen here during typing, and we don't want to bother the user with
-        # messages related to it in console
+        # Parsing errors can happen during typing - silently use fallback
         prompt_schedules = [[[steps, text]]]
 
     try:
         cond_stage_model = sd_models.model_data.sd_model.cond_stage_model
-        assert cond_stage_model is not None
+        if cond_stage_model is None:
+            return "<span class='gr-box gr-text-input'>?/?</span>"
     except Exception:
-        return f"<span class='gr-box gr-text-input'>?/?</span>"
+        return "<span class='gr-box gr-text-input'>?/?</span>"
 
-    flat_prompts = reduce(lambda list1, list2: list1+list2, prompt_schedules)
+    flat_prompts = reduce(lambda list1, list2: list1 + list2, prompt_schedules)
     prompts = [prompt_text for step, prompt_text in flat_prompts]
-    token_count, max_length = max([model_hijack.get_prompt_lengths(prompt, cond_stage_model) for prompt in prompts], key=lambda args: args[0])
+
+    if not prompts:
+        return "<span class='gr-box gr-text-input'>0/?</span>"
+
+    token_count, max_length = max(
+        [model_hijack.get_prompt_lengths(prompt, cond_stage_model) for prompt in prompts],
+        key=lambda args: args[0]
+    )
     return f"<span class='gr-box gr-text-input'>{token_count}/{max_length}</span>"
 
 
@@ -209,27 +231,32 @@ def apply_setting(key, value):
     if shared.cmd_opts.freeze_settings:
         return gr.update()
 
-    # dont allow model to be swapped when model hash exists in prompt
+    # Don't allow model swap when model hash exists in prompt
     if key == "sd_model_checkpoint" and opts.disable_weights_auto_swap:
         return gr.update()
 
     if key == "sd_model_checkpoint":
         ckpt_info = sd_models.get_closet_checkpoint_match(value)
-
         if ckpt_info is not None:
             value = ckpt_info.title
         else:
             return gr.update()
 
-    comp_args = opts.data_labels[key].component_args
-    if comp_args and isinstance(comp_args, dict) and comp_args.get('visible') is False:
-        return
+    # Check if component is visible
+    data_label = opts.data_labels.get(key)
+    if data_label is None:
+        return gr.update()
 
-    valtype = type(opts.data_labels[key].default)
+    comp_args = data_label.component_args
+    if comp_args and isinstance(comp_args, dict) and comp_args.get('visible') is False:
+        return gr.update()
+
+    valtype = type(data_label.default)
     oldval = opts.data.get(key, None)
     opts.data[key] = valtype(value) if valtype != type(None) else value
-    if oldval != value and opts.data_labels[key].onchange is not None:
-        opts.data_labels[key].onchange()
+
+    if oldval != value and data_label.onchange is not None:
+        data_label.onchange()
 
     opts.save(shared.config_filename)
     return getattr(opts, key)
@@ -237,7 +264,6 @@ def apply_setting(key, value):
 
 def create_output_panel(tabname, outdir, toprow=None):
     return ui_common.create_output_panel(tabname, outdir, toprow)
-
 
 
 def ordered_ui_categories():
@@ -248,7 +274,10 @@ def ordered_ui_categories():
 
 
 def create_override_settings_dropdown(tabname, row):
-    dropdown = gr.Dropdown([], label="Override settings", visible=False, elem_id=f"{tabname}_override_settings", multiselect=True)
+    dropdown = gr.Dropdown(
+        [], label="Override settings", visible=False,
+        elem_id=f"{tabname}_override_settings", multiselect=True
+    )
 
     dropdown.change(
         fn=lambda x: gr.Dropdown.update(visible=bool(x)),
@@ -275,7 +304,7 @@ def create_ui():
 
     with gr.Blocks(analytics_enabled=False) as txt2img_interface:
         toprow = ui_toprow.Toprow(is_img2img=False, is_compact=shared.opts.compact_prompt_box)
-
+        # Shared dummy component for all tabs
         dummy_component = gr.Label(visible=False)
 
         extra_tabs = gr.Tabs(elem_id="txt2img_extra_tabs", elem_classes=["extra-networks"])
@@ -335,7 +364,6 @@ def create_ui():
                                     hr_cfg = gr.Slider(minimum=0.0, maximum=30.0, step=0.1, label="Hires CFG Scale", value=0.0, elem_id="txt2img_hr_cfg")
 
                                 with FormRow(elem_id="txt2img_hires_fix_row3", variant="compact", visible=opts.hires_fix_show_sampler) as hr_sampler_container:
-
                                     hr_checkpoint_name = gr.Dropdown(label='Checkpoint', elem_id="hr_checkpoint", choices=["Use same checkpoint"] + modules.sd_models.checkpoint_tiles(use_short=True), value="Use same checkpoint")
                                     create_refresh_button(hr_checkpoint_name, modules.sd_models.list_models, lambda: {"choices": ["Use same checkpoint"] + modules.sd_models.checkpoint_tiles(use_short=True)}, "hr_checkpoint_refresh")
 
@@ -571,11 +599,14 @@ def create_ui():
                                 add_copy_image_controls('inpaint_sketch', inpaint_color_sketch)
 
                                 def update_orig(image, state):
-                                    if image is not None:
-                                        same_size = state is not None and state.size == image.size
-                                        has_exact_match = np.any(np.all(np.array(image) == np.array(state), axis=-1))
-                                        edited = same_size and has_exact_match
-                                        return image if not edited or state is None else state
+                                    if image is None:
+                                        return state
+                                    if state is None:
+                                        return image
+                                    same_size = state.size == image.size
+                                    has_exact_match = np.any(np.all(np.array(image) == np.array(state), axis=-1))
+                                    edited = same_size and has_exact_match
+                                    return state if edited else image
 
                                 inpaint_color_sketch.change(update_orig, [inpaint_color_sketch, inpaint_color_sketch_orig], inpaint_color_sketch_orig)
 
@@ -607,7 +638,6 @@ def create_ui():
                         def copy_image(img):
                             if isinstance(img, dict) and 'image' in img:
                                 return img['image']
-
                             return img
 
                         for button, name, elem in copy_image_buttons:
@@ -617,7 +647,7 @@ def create_ui():
                                 outputs=[copy_image_destinations[name]],
                             )
                             button.click(
-                                fn=lambda: None,
+                                fn=None,
                                 _js=f"switch_to_{name.replace(' ', '_')}",
                                 inputs=[],
                                 outputs=[],
@@ -720,14 +750,12 @@ def create_ui():
                     if category not in {"accordions"}:
                         scripts.scripts_img2img.setup_ui_for_section(category)
 
-            # the code below is meant to update the resolution label after the image in the image selection UI has changed.
-            # as it is now the event keeps firing continuously for inpaint edits, which ruins the page with constant requests.
-            # I assume this must be a gradio bug and for now we'll just do it for non-inpaint inputs.
+            # Update resolution label after image change (excluding inpaint to avoid continuous firing)
             for component in [init_img, sketch]:
                 component.change(fn=lambda: None, _js="updateImg2imgResizeToTextAfterChangingImage", inputs=[], outputs=[], show_progress=False)
 
             def select_img2img_tab(tab):
-                return gr.update(visible=tab in [2, 3, 4]), gr.update(visible=tab == 3),
+                return gr.update(visible=tab in [2, 3, 4]), gr.update(visible=tab == 3)
 
             for i, elem in enumerate(img2img_tabs):
                 elem.select(
@@ -928,7 +956,7 @@ def create_ui():
                     new_hypernetwork_sizes = gr.CheckboxGroup(label="Modules", value=["768", "320", "640", "1280"], choices=["768", "1024", "320", "640", "1280"], elem_id="train_new_hypernetwork_sizes")
                     new_hypernetwork_layer_structure = gr.Textbox("1, 2, 1", label="Enter hypernetwork layer structure", placeholder="1st and last digit must be 1. ex:'1, 2, 1'", elem_id="train_new_hypernetwork_layer_structure")
                     new_hypernetwork_activation_func = gr.Dropdown(value="linear", label="Select activation function of hypernetwork. Recommended : Swish / Linear(none)", choices=hypernetworks_ui.keys, elem_id="train_new_hypernetwork_activation_func")
-                    new_hypernetwork_initialization_option = gr.Dropdown(value = "Normal", label="Select Layer weights initialization. Recommended: Kaiming for relu-like, Xavier for sigmoid-like, Normal otherwise", choices=["Normal", "KaimingUniform", "KaimingNormal", "XavierUniform", "XavierNormal"], elem_id="train_new_hypernetwork_initialization_option")
+                    new_hypernetwork_initialization_option = gr.Dropdown(value="Normal", label="Select Layer weights initialization. Recommended: Kaiming for relu-like, Xavier for sigmoid-like, Normal otherwise", choices=["Normal", "KaimingUniform", "KaimingNormal", "XavierUniform", "XavierNormal"], elem_id="train_new_hypernetwork_initialization_option")
                     new_hypernetwork_add_layer_norm = gr.Checkbox(label="Add layer normalization", elem_id="train_new_hypernetwork_add_layer_norm")
                     new_hypernetwork_use_dropout = gr.Checkbox(label="Use dropout", elem_id="train_new_hypernetwork_use_dropout")
                     new_hypernetwork_dropout_structure = gr.Textbox("0, 0, 0", label="Enter hypernetwork Dropout structure (or empty). Recommended : 0~0.35 incrementing sequence: 0, 0.05, 0.15", placeholder="1st and last digit must be 0 and values should be between 0 and 1. ex:'0, 0.01, 0'")
@@ -1201,7 +1229,7 @@ version: <a href="https://github.com/Panchovix/stable-diffusion-webui-reForge/co
 &#x2000;•&#x2000;
 python: <span title="{sys.version}">{python_version}</span>
 &#x2000;•&#x2000;
-torch: {getattr(torch, '__long_version__',torch.__version__)}
+torch: {getattr(torch, '__long_version__', torch.__version__)}
 &#x2000;•&#x2000;
 xformers: {xformers_version}
 &#x2000;•&#x2000;
