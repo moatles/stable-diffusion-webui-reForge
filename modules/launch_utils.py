@@ -1019,7 +1019,7 @@ def prepare_environment():
     )
     stable_diffusion_xl_repo = os.environ.get(
         'STABLE_DIFFUSION_XL_REPO',
-        "https://github.com/Stability-AI/generative-models.git"
+        "https://github.com/moatles/generative-models.git"
     )
     k_diffusion_repo = os.environ.get(
         'K_DIFFUSION_REPO',
