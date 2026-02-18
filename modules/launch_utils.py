@@ -13,8 +13,9 @@ import importlib.util
 import importlib.metadata
 import json
 import shlex
+import tempfile
 from functools import lru_cache
-from typing import NamedTuple, Optional
+from typing import NamedTuple, Optional, Tuple
 from pathlib import Path
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
@@ -38,9 +39,17 @@ default_command_live = os.environ.get('WEBUI_LAUNCH_LIVE_OUTPUT') == "1"
 
 os.environ.setdefault('GRADIO_ANALYTICS_ENABLED', 'False')
 
+# Packages that pull in CUDA dependencies and should be installed with --no-deps on AMD
+AMD_NODEPS_PACKAGES = {'transformers', 'accelerate', 'diffusers', 'xformers'}
 
 # GPU Detection Cache
 _gpu_info_cache: Optional[dict] = None
+
+# Extension installer timeout in seconds
+EXTENSION_INSTALL_TIMEOUT = 300
+
+# Cache for requirements check to avoid reinstalling on every launch
+_requirements_checked = False
 
 
 def detect_gpu() -> dict:
@@ -170,7 +179,7 @@ def commit_hash():
     try:
         return subprocess.check_output(
             [git, "-C", script_path, "rev-parse", "HEAD"],
-            encoding='utf8', stderr=subprocess.DEVNULL
+            encoding='utf8', stderr=subprocess.DEVNULL, timeout=10
         ).strip()
     except Exception:
         return "<none>"
@@ -181,7 +190,7 @@ def git_tag_a1111():
     try:
         return subprocess.check_output(
             [git, "-C", script_path, "describe", "--tags"],
-            encoding='utf8', stderr=subprocess.DEVNULL
+            encoding='utf8', stderr=subprocess.DEVNULL, timeout=10
         ).strip()
     except Exception:
         try:
@@ -197,7 +206,7 @@ def git_tag():
     return f'f{forge_version.version}-{git_tag_a1111()}'
 
 
-def run(command, desc=None, errdesc=None, custom_env=None, live: bool = default_command_live) -> str:
+def run(command, desc=None, errdesc=None, custom_env=None, live: bool = default_command_live, timeout=None) -> str:
     if desc is not None:
         print(desc)
 
@@ -209,10 +218,16 @@ def run(command, desc=None, errdesc=None, custom_env=None, live: bool = default_
         "errors": 'ignore',
     }
 
+    if timeout is not None:
+        run_kwargs["timeout"] = timeout
+
     if not live:
         run_kwargs["stdout"] = run_kwargs["stderr"] = subprocess.PIPE
 
-    result = subprocess.run(**run_kwargs)
+    try:
+        result = subprocess.run(**run_kwargs)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"Command timed out after {timeout}s: {command}")
 
     if result.returncode != 0:
         error_bits = [
@@ -230,13 +245,24 @@ def run(command, desc=None, errdesc=None, custom_env=None, live: bool = default_
 
 
 def is_installed(package):
+    """Check if a package is installed using importlib.metadata only."""
     try:
-        return importlib.metadata.distribution(package) is not None
+        importlib.metadata.distribution(package)
+        return True
     except importlib.metadata.PackageNotFoundError:
+        # Normalize package name and try again
+        normalized = package.lower().replace('-', '_').replace('.', '_')
         try:
-            return importlib.util.find_spec(package) is not None
-        except ModuleNotFoundError:
-            return False
+            importlib.metadata.distribution(normalized)
+            return True
+        except importlib.metadata.PackageNotFoundError:
+            # Try with hyphens
+            hyphenated = package.lower().replace('_', '-')
+            try:
+                importlib.metadata.distribution(hyphenated)
+                return True
+            except importlib.metadata.PackageNotFoundError:
+                return False
 
 
 def get_package_version(package):
@@ -244,30 +270,40 @@ def get_package_version(package):
     try:
         return importlib.metadata.version(package)
     except importlib.metadata.PackageNotFoundError:
-        return None
+        # Try normalized name
+        normalized = package.lower().replace('-', '_').replace('.', '_')
+        try:
+            return importlib.metadata.version(normalized)
+        except importlib.metadata.PackageNotFoundError:
+            # Try with hyphens
+            hyphenated = package.lower().replace('_', '-')
+            try:
+                return importlib.metadata.version(hyphenated)
+            except importlib.metadata.PackageNotFoundError:
+                return None
+
+
+def parse_version(v: str) -> Tuple[int, ...]:
+    """Parse version string into tuple of integers for comparison."""
+    parts = []
+    for part in re.split(r'[.\-_+]', str(v)):
+        match = re.match(r'^(\d+)', part)
+        if match:
+            parts.append(int(match.group(1)))
+    return tuple(parts) if parts else (0,)
 
 
 def compare_versions(v1, v2):
     """
-    Compare two version strings without requiring packaging module.
+    Compare two version strings.
     Returns: -1 if v1 < v2, 0 if v1 == v2, 1 if v1 > v2
     """
-    def normalize(v):
-        parts = []
-        for part in re.split(r'[.\-_]', v):
-            numeric = re.match(r'^(\d+)', part)
-            if numeric:
-                parts.append(int(numeric.group(1)))
-            else:
-                parts.append(0)
-        return parts
-
-    v1_parts = normalize(v1)
-    v2_parts = normalize(v2)
+    v1_parts = parse_version(v1)
+    v2_parts = parse_version(v2)
 
     max_len = max(len(v1_parts), len(v2_parts))
-    v1_parts.extend([0] * (max_len - len(v1_parts)))
-    v2_parts.extend([0] * (max_len - len(v2_parts)))
+    v1_parts = v1_parts + (0,) * (max_len - len(v1_parts))
+    v2_parts = v2_parts + (0,) * (max_len - len(v2_parts))
 
     for a, b in zip(v1_parts, v2_parts):
         if a < b:
@@ -277,11 +313,53 @@ def compare_versions(v1, v2):
     return 0
 
 
+def version_satisfies(installed: str, requirement: str) -> bool:
+    """
+    Check if installed version satisfies a version requirement.
+    Handles ==, >=, <=, >, <, != operators and comma-separated constraints.
+    """
+    if not installed or not requirement:
+        return not requirement  # No requirement means satisfied
+
+    installed = installed.strip()
+    requirement = requirement.strip()
+
+    # Handle comma-separated constraints (e.g., ">=0.21,<0.22")
+    if ',' in requirement:
+        constraints = [c.strip() for c in requirement.split(',')]
+        return all(version_satisfies(installed, c) for c in constraints)
+
+    # Parse operator and version
+    match = re.match(r'^([<>=!]+)?\s*(.+)$', requirement)
+    if not match:
+        return True
+
+    op = match.group(1) or '=='
+    required_ver = match.group(2).strip()
+
+    cmp = compare_versions(installed, required_ver)
+
+    if op == '==':
+        return cmp == 0
+    elif op == '>=':
+        return cmp >= 0
+    elif op == '<=':
+        return cmp <= 0
+    elif op == '>':
+        return cmp > 0
+    elif op == '<':
+        return cmp < 0
+    elif op == '!=':
+        return cmp != 0
+    else:
+        return True
+
+
 def repo_dir(name):
     return os.path.join(script_path, dir_repos, name)
 
 
-def run_pip(command, desc=None, live=default_command_live):
+def run_pip(command, desc=None, live=default_command_live, timeout=120):
     """Run a uv pip command (named run_pip for backward compatibility)."""
     if args.skip_install:
         return
@@ -289,9 +367,10 @@ def run_pip(command, desc=None, live=default_command_live):
     index_url_line = f' --index-url {index_url}' if index_url else ''
     return run(
         f'uv pip {command}{index_url_line}',
-        desc=f"Installing {desc}",
-        errdesc=f"Couldn't install {desc}",
-        live=live
+        desc=f"Installing {desc}" if desc else None,
+        errdesc=f"Couldn't install {desc}" if desc else "Couldn't run pip command",
+        live=live,
+        timeout=timeout
     )
 
 
@@ -300,24 +379,27 @@ run_uv = run_pip
 
 
 def check_run_python(code: str) -> bool:
-    result = subprocess.run([python, "-c", code], capture_output=True)
-    return result.returncode == 0
+    try:
+        result = subprocess.run([python, "-c", code], capture_output=True, timeout=30)
+        return result.returncode == 0
+    except subprocess.TimeoutExpired:
+        return False
 
 
 def git_fix_workspace(directory, name):
     run(f'{git} -C "{directory}" fetch --refetch --no-auto-gc',
         f"Fetching all contents for {name}",
-        f"Couldn't fetch {name}", live=True)
+        f"Couldn't fetch {name}", live=True, timeout=300)
     run(f'{git} -C "{directory}" gc --aggressive --prune=now',
         f"Pruning {name}",
-        f"Couldn't prune {name}", live=True)
+        f"Couldn't prune {name}", live=True, timeout=300)
 
 
 def run_git(directory, name, command, desc=None, errdesc=None, custom_env=None,
             live: bool = default_command_live, autofix=True):
     try:
         return run(f'{git} -C "{directory}" {command}', desc=desc, errdesc=errdesc,
-                   custom_env=custom_env, live=live)
+                   custom_env=custom_env, live=live, timeout=120)
     except RuntimeError:
         if not autofix:
             raise
@@ -325,7 +407,7 @@ def run_git(directory, name, command, desc=None, errdesc=None, custom_env=None,
     print(f"{errdesc}, attempting autofix...")
     git_fix_workspace(directory, name)
     return run(f'{git} -C "{directory}" {command}', desc=desc, errdesc=errdesc,
-               custom_env=custom_env, live=live)
+               custom_env=custom_env, live=live, timeout=120)
 
 
 def git_clone(url, directory, name, commithash=None):
@@ -354,22 +436,24 @@ def git_clone(url, directory, name, commithash=None):
     try:
         run(f'{git} clone --config core.filemode=false "{url}" "{directory}"',
             f"Cloning {name} into {directory}...",
-            f"Couldn't clone {name}", live=True)
+            f"Couldn't clone {name}", live=True, timeout=600)
     except RuntimeError:
         shutil.rmtree(directory, ignore_errors=True)
         raise
 
     if commithash is not None:
         run(f'{git} -C "{directory}" checkout {commithash}', None,
-            f"Couldn't checkout {name}'s hash: {commithash}")
+            f"Couldn't checkout {name}'s hash: {commithash}", timeout=60)
 
 
 def git_pull_recursive(directory):
     for subdir, _, _ in os.walk(directory):
         if os.path.exists(os.path.join(subdir, '.git')):
             try:
-                output = subprocess.check_output([git, '-C', subdir, 'pull', '--autostash'])
+                output = subprocess.check_output([git, '-C', subdir, 'pull', '--autostash'], timeout=60)
                 print(f"Pulled changes for repository in '{subdir}':\n{output.decode('utf-8').strip()}\n")
+            except subprocess.TimeoutExpired:
+                print(f"Timeout pulling repository in '{subdir}'")
             except subprocess.CalledProcessError as e:
                 print(f"Couldn't perform 'git pull' on repository in '{subdir}':\n{e.output.decode('utf-8').strip()}\n")
 
@@ -395,21 +479,41 @@ def version_check(commit):
 
 
 def run_extension_installer(extension_dir):
+    """Run extension installer with timeout protection."""
     path_installer = os.path.join(extension_dir, "install.py")
     if not os.path.isfile(path_installer):
         return
+
+    extension_name = os.path.basename(extension_dir)
+    print(f"    Running install.py for {extension_name}...")
 
     try:
         env = os.environ.copy()
         env['PYTHONPATH'] = f"{script_path}{os.pathsep}{env.get('PYTHONPATH', '')}"
 
-        stdout = run(f'"{python}" "{path_installer}"',
-                     errdesc=f"Error running install.py for extension {extension_dir}",
-                     custom_env=env).strip()
-        if stdout:
-            print(stdout)
+        # Use subprocess with timeout instead of exec
+        result = subprocess.run(
+            [python, path_installer],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=EXTENSION_INSTALL_TIMEOUT,
+            cwd=extension_dir
+        )
+
+        if result.stdout:
+            output = result.stdout.strip()
+            if output:
+                for line in output.split('\n'):
+                    print(f"    {line}")
+
+        if result.returncode != 0 and result.stderr:
+            print(f"    Warning: {result.stderr.strip()}")
+
+    except subprocess.TimeoutExpired:
+        print(f"    Warning: install.py for {extension_name} timed out after {EXTENSION_INSTALL_TIMEOUT}s")
     except Exception as e:
-        errors.report(str(e))
+        print(f"    Warning: Error running install.py for {extension_name}: {e}")
 
 
 def load_settings(settings_file):
@@ -466,9 +570,19 @@ def list_extensions_builtin(settings_file):
 
 
 def run_extensions_installers(settings_file):
+    print("Running extension installers...")
+
+    extensions_count = 0
+    builtin_count = 0
+
     if os.path.isdir(extensions_dir):
+        extensions = list_extensions(settings_file)
+        extensions_count = len(extensions)
+        print(f"  Found {extensions_count} extensions")
+
         with startup_timer.subcategory("run extensions installers"):
-            for dirname_extension in list_extensions(settings_file):
+            for i, dirname_extension in enumerate(extensions, 1):
+                print(f"  [{i}/{extensions_count}] Processing {dirname_extension}...")
                 logging.debug(f"Installing {dirname_extension}")
                 path = os.path.join(extensions_dir, dirname_extension)
                 if os.path.isdir(path):
@@ -476,16 +590,46 @@ def run_extensions_installers(settings_file):
                     startup_timer.record(dirname_extension)
 
     if os.path.isdir(extensions_builtin_dir):
+        extensions_builtin = list_extensions_builtin(settings_file)
+        builtin_count = len(extensions_builtin)
+        print(f"  Found {builtin_count} builtin extensions")
+
         with startup_timer.subcategory("run extensions_builtin installers"):
-            for dirname_extension in list_extensions_builtin(settings_file):
+            for i, dirname_extension in enumerate(extensions_builtin, 1):
+                print(f"  [{i}/{builtin_count}] Processing builtin {dirname_extension}...")
                 logging.debug(f"Installing {dirname_extension}")
                 path = os.path.join(extensions_builtin_dir, dirname_extension)
                 if os.path.isdir(path):
                     run_extension_installer(path)
                     startup_timer.record(dirname_extension)
 
+    print(f"Extension installers completed. ({extensions_count} extensions, {builtin_count} builtin)")
 
-RE_REQUIREMENT = re.compile(r"\s*([-_a-zA-Z0-9]+)\s*(?:==\s*([-+_.a-zA-Z0-9]+))?\s*")
+
+RE_REQUIREMENT = re.compile(r"\s*([-_a-zA-Z0-9]+)\s*(?:([<>=!]+)\s*([-+_.a-zA-Z0-9]+))?\s*")
+
+
+def parse_requirement_line(line):
+    """
+    Parse a requirement line and return (package_name, version_spec, original_line).
+    Returns (None, None, None) for comments/empty lines.
+    """
+    line = line.strip()
+    if not line or line.startswith('#'):
+        return None, None, None
+
+    # Skip git/url requirements
+    if line.startswith(('git+', 'http://', 'https://')):
+        return None, None, line
+
+    # Extract package name (handles ==, >=, <=, ~=, !=, etc.)
+    match = re.match(r'^([a-zA-Z0-9_-]+(?:\[[^\]]+\])?)\s*([<>=!~,\d\.\s]+)?$', line)
+    if match:
+        package = match.group(1).split('[')[0]  # Remove extras like [cuda]
+        version_spec = match.group(2) or ''
+        return package.lower().replace('-', '_'), version_spec.strip(), line
+
+    return None, None, line
 
 
 def requirements_met(requirements_file):
@@ -500,26 +644,217 @@ def requirements_met(requirements_file):
                 if not line or line.startswith('#'):
                     continue
 
-                m = RE_REQUIREMENT.match(line)
-                if m is None:
-                    return False
-
-                package = m.group(1).strip()
-                version_required = (m.group(2) or "").strip()
-
-                if not version_required:
+                # Skip URL-based requirements
+                if line.startswith(('git+', 'http://', 'https://')):
                     continue
 
-                version_installed = get_package_version(package)
-                if version_installed is None:
+                # Parse package name and version spec
+                match = re.match(r'^([a-zA-Z0-9_-]+)(.*)$', line)
+                if not match:
+                    continue
+
+                package = match.group(1).strip()
+                version_spec = match.group(2).strip()
+
+                installed_version = get_package_version(package)
+                if installed_version is None:
                     return False
 
-                if compare_versions(version_required, version_installed) != 0:
+                # Check version constraint if specified
+                if version_spec and not version_satisfies(installed_version, version_spec):
                     return False
     except FileNotFoundError:
         return False
 
     return True
+
+
+def check_amd_deps_installed() -> bool:
+    """
+    Check if AMD-specific dependencies are correctly installed.
+    Returns True if all deps are satisfied, False if reinstall needed.
+    """
+    # Check transformers deps
+    tokenizers_ver = get_package_version('tokenizers')
+    if tokenizers_ver and not version_satisfies(tokenizers_ver, '>=0.21,<0.22'):
+        return False
+
+    # Check that essential packages are installed
+    essential = ['transformers', 'accelerate', 'huggingface-hub', 'safetensors', 'tokenizers']
+    for pkg in essential:
+        if not is_installed(pkg):
+            return False
+
+    return True
+
+
+def install_requirements_amd(requirements_file):
+    """
+    Install requirements for AMD GPU, handling packages that might pull CUDA deps.
+    Installs problematic packages with --no-deps to prevent CUDA contamination,
+    but first installs their safe dependencies with correct versions.
+    """
+    global _requirements_checked
+
+    # Skip if already checked this session and deps are satisfied
+    if _requirements_checked and check_amd_deps_installed():
+        print("  All AMD requirements already satisfied.")
+        return
+
+    print(f"Installing requirements for AMD GPU from {requirements_file}")
+
+    # Dependencies of packages that are safe (don't pull CUDA)
+    # Version constraints match transformers==4.44.0 and other package requirements
+    AMD_SAFE_DEPS = {
+        'transformers': [
+            'tokenizers>=0.21,<0.22',
+            'huggingface-hub>=0.23.0,<1.0',
+            'safetensors>=0.4.1',
+            'regex!=2019.12.17',
+            'requests',
+            'tqdm>=4.27',
+            'pyyaml>=5.1',
+            'packaging>=20.0',
+            'filelock',
+            'numpy',
+        ],
+        'accelerate': [
+            'huggingface-hub>=0.21.0',
+            'safetensors>=0.4.3',
+            'pyyaml',
+            'packaging>=20.0',
+            'psutil',
+            'numpy>=1.17',
+        ],
+        'diffusers': [
+            'huggingface-hub>=0.23.2',
+            'safetensors>=0.3.1',
+            'requests',
+            'pillow',
+            'pyyaml',
+            'packaging',
+            'regex!=2019.12.17',
+            'importlib-metadata',
+            'numpy',
+        ],
+    }
+
+    try:
+        with open(requirements_file, "r", encoding="utf8") as f:
+            lines = f.readlines()
+    except FileNotFoundError:
+        print(f"Requirements file not found: {requirements_file}")
+        return
+
+    # Separate packages into normal and no-deps categories
+    normal_packages = []
+    nodeps_packages = []
+    skip_packages = {'torch', 'torchvision', 'xformers', 'open_clip_torch', 'open-clip-torch'}
+
+    for line in lines:
+        package_name, version_spec, original = parse_requirement_line(line)
+
+        if original is None:
+            continue  # Skip empty/comment lines
+
+        if package_name is None:
+            # URL-based requirement, install as-is
+            normal_packages.append(original)
+            continue
+
+        if package_name in skip_packages or package_name.replace('_', '-') in skip_packages:
+            print(f"  Skipping {package_name} (already handled)")
+            continue
+
+        if package_name in AMD_NODEPS_PACKAGES:
+            nodeps_packages.append((package_name, original))
+        else:
+            normal_packages.append(original)
+
+    # Check if normal packages need installation
+    normal_needed = []
+    for pkg_line in normal_packages:
+        pkg_name, ver_spec, _ = parse_requirement_line(pkg_line)
+        if pkg_name:
+            installed = get_package_version(pkg_name)
+            if not installed:
+                normal_needed.append(pkg_line)
+            elif ver_spec and not version_satisfies(installed, ver_spec):
+                normal_needed.append(pkg_line)
+        else:
+            # URL package - check by other means or just include
+            normal_needed.append(pkg_line)
+
+    # Install normal packages if needed
+    if normal_needed:
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf8') as tmp:
+            tmp.write('\n'.join(normal_needed))
+            tmp_path = tmp.name
+
+        try:
+            run(
+                f'uv pip install -r "{tmp_path}"',
+                desc=f"Installing {len(normal_needed)} standard requirements",
+                errdesc="Couldn't install requirements",
+                live=True,
+                timeout=600
+            )
+        finally:
+            os.unlink(tmp_path)
+    else:
+        print("  Standard requirements already satisfied.")
+
+    # Install no-deps packages: first their dependencies, then the package itself
+    for package_name, pkg_spec in nodeps_packages:
+        # Check if deps need installation
+        if package_name in AMD_SAFE_DEPS:
+            deps_needed = []
+            for dep in AMD_SAFE_DEPS[package_name]:
+                # Parse dep name and version
+                dep_match = re.match(r'^([a-zA-Z0-9_-]+)(.*)$', dep)
+                if dep_match:
+                    dep_name = dep_match.group(1)
+                    dep_ver = dep_match.group(2).strip()
+                    installed = get_package_version(dep_name)
+                    if not installed:
+                        deps_needed.append(dep)
+                    elif dep_ver and not version_satisfies(installed, dep_ver):
+                        deps_needed.append(dep)
+
+            if deps_needed:
+                print(f"  Installing {package_name} dependencies: {', '.join(d.split('>=')[0].split('<')[0] for d in deps_needed)}")
+                try:
+                    with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf8') as tmp:
+                        tmp.write('\n'.join(deps_needed))
+                        tmp_path = tmp.name
+                    try:
+                        run(
+                            f'uv pip install -r "{tmp_path}"',
+                            errdesc=f"Couldn't install {package_name} dependencies",
+                            live=True,
+                            timeout=180
+                        )
+                    finally:
+                        os.unlink(tmp_path)
+                except RuntimeError as e:
+                    print(f"  Warning: Failed to install some dependencies: {e}")
+
+        # Then install the package itself with --no-deps if not installed
+        if is_installed(package_name):
+            print(f"  {package_name} already installed")
+        else:
+            print(f"  Installing {pkg_spec} with --no-deps (AMD compatibility)")
+            try:
+                run(
+                    f'uv pip install --no-deps "{pkg_spec}"',
+                    errdesc=f"Couldn't install {pkg_spec}",
+                    live=True,
+                    timeout=120
+                )
+            except RuntimeError as e:
+                print(f"  Warning: Failed to install {pkg_spec}: {e}")
+
+    _requirements_checked = True
 
 
 def get_cuda_compute_cap():
@@ -533,7 +868,7 @@ def get_cuda_compute_cap():
     try:
         output = subprocess.check_output(
             ['nvidia-smi', '--query-gpu=compute_cap', '--format=noheader,csv'],
-            text=True, stderr=subprocess.DEVNULL
+            text=True, stderr=subprocess.DEVNULL, timeout=10
         ).splitlines()
         return max(map(float, filter(None, output)))
     except Exception:
@@ -558,7 +893,8 @@ def install_setuptools():
             'uv pip install "setuptools<70.0.0"',
             desc="Installing setuptools<70.0.0 (required for package builds)",
             errdesc="Couldn't install setuptools",
-            live=True
+            live=True,
+            timeout=60
         )
         startup_timer.record("install setuptools")
 
@@ -577,12 +913,57 @@ def install_clip():
         f'uv pip install --no-build-isolation --no-deps {clip_package}',
         desc="Installing CLIP (required dependency)",
         errdesc="Couldn't install CLIP",
-        live=True
+        live=True,
+        timeout=120
     )
     startup_timer.record("install clip")
 
 
+def cleanup_nvidia_packages():
+    """Remove NVIDIA/CUDA packages that may have been accidentally installed on AMD."""
+    nvidia_packages = [
+        'nvidia-cuda-cupti-cu12',
+        'nvidia-cuda-nvrtc-cu12',
+        'nvidia-cuda-runtime-cu12',
+        'nvidia-cudnn-cu12',
+        'nvidia-cufft-cu12',
+        'nvidia-curand-cu12',
+        'nvidia-cusolver-cu12',
+        'nvidia-cusparse-cu12',
+        'nvidia-cusparselt-cu12',
+        'nvidia-nccl-cu12',
+        'nvidia-nvjitlink-cu12',
+        'nvidia-nvtx-cu12',
+        'nvidia-cublas-cu12',
+        'nvidia-nvshmem-cu12',
+        'triton',  # NVIDIA triton (we have pytorch-triton-rocm instead)
+    ]
+
+    packages_to_remove = []
+    for pkg in nvidia_packages:
+        if is_installed(pkg):
+            packages_to_remove.append(pkg)
+
+    if not packages_to_remove:
+        print("No NVIDIA packages to clean up.")
+        return
+
+    print(f"Cleaning up NVIDIA packages on AMD system: {', '.join(packages_to_remove)}")
+    try:
+        run(
+            f"uv pip uninstall {' '.join(packages_to_remove)}",
+            desc="Removing NVIDIA packages",
+            errdesc="Couldn't remove NVIDIA packages",
+            live=True,
+            timeout=60
+        )
+    except Exception as e:
+        print(f"Warning: Failed to remove some NVIDIA packages: {e}")
+
+
 def prepare_environment():
+    global _requirements_checked
+
     gpu_info = detect_gpu()
     print(f"Detected GPU: {gpu_info['vendor'].upper()} - {gpu_info['model']}")
     if gpu_info['vram_mb'] > 0:
@@ -678,7 +1059,7 @@ def prepare_environment():
 
     # Install torch BEFORE clip to ensure correct backend (ROCm vs CUDA)
     if args.reinstall_torch or not is_installed("torch") or not is_installed("torchvision"):
-        run(torch_command, "Installing torch and torchvision", "Couldn't install torch", live=True)
+        run(torch_command, "Installing torch and torchvision", "Couldn't install torch", live=True, timeout=1800)
         startup_timer.record("install torch")
 
     # Now install CLIP (after torch, so it uses the correct torch version)
@@ -697,34 +1078,45 @@ def prepare_environment():
     startup_timer.record("torch GPU test")
 
     # Verify AMD ROCm setup
-    if is_amd_gpu() and not args.skip_torch_cuda_test:
-        if not check_run_python("import torch; assert torch.cuda.is_available() or hasattr(torch.version, 'hip')"):
-            print("Warning: AMD GPU detected but ROCm may not be properly configured")
-            print("Make sure ROCm is installed and HSA_OVERRIDE_GFX_VERSION is set if needed")
+    if is_amd_gpu():
+        print("Verifying AMD ROCm setup...")
+        if check_run_python("import torch; print(f'ROCm: {torch.version.hip}'); assert torch.cuda.is_available()"):
+            print("  ROCm is working correctly.")
+        else:
+            print("  Warning: AMD GPU detected but ROCm may not be properly configured")
+            print("  Make sure ROCm is installed and HSA_OVERRIDE_GFX_VERSION is set if needed")
 
-    if not is_installed("open_clip"):
-        run_pip(f"install {openclip_package}", "open_clip")
+    # Install open_clip with dependencies (ftfy, regex, tqdm - all safe, no CUDA)
+    if not is_installed("open_clip_torch") and not is_installed("open-clip-torch"):
+        run_pip(f"install {openclip_package}", "open_clip", timeout=120)
         startup_timer.record("install open_clip")
+    else:
+        # Ensure open_clip dependencies are present
+        openclip_deps = ['ftfy', 'regex', 'tqdm']
+        missing_deps = [d for d in openclip_deps if not is_installed(d)]
+        if missing_deps:
+            run_pip(f"install {' '.join(missing_deps)}", "open_clip dependencies", timeout=60)
 
     # Only install xformers for NVIDIA GPUs
     if xformers_package is not None and not is_amd_gpu():
         if (not is_installed("xformers") or args.reinstall_xformers) and args.xformers:
-            run_pip(f"install --upgrade --reinstall --no-deps {xformers_package}", "xformers")
+            run_pip(f"install --upgrade --reinstall --no-deps {xformers_package}", "xformers", timeout=120)
             startup_timer.record("install xformers")
     elif is_amd_gpu() and is_installed("xformers"):
         # Remove xformers if AMD GPU (not compatible)
         print("AMD GPU detected - removing incompatible xformers...")
         try:
-            run("uv pip uninstall xformers -y", "Removing xformers", "Couldn't remove xformers", live=True)
+            run("uv pip uninstall xformers", "Removing xformers", "Couldn't remove xformers", live=True, timeout=30)
         except Exception:
             pass
 
     if not is_installed("ngrok") and args.ngrok:
-        run_pip("install ngrok", "ngrok")
+        run_pip("install ngrok", "ngrok", timeout=60)
         startup_timer.record("install ngrok")
 
     os.makedirs(os.path.join(script_path, dir_repos), exist_ok=True)
 
+    print("Cloning repositories...")
     git_clone(assets_repo, repo_dir('stable-diffusion-webui-assets'), "assets", assets_commit_hash)
     git_clone(stable_diffusion_repo, repo_dir('stable-diffusion-stability-ai'),
               "Stable Diffusion", stable_diffusion_commit_hash)
@@ -738,20 +1130,29 @@ def prepare_environment():
     if not os.path.isfile(requirements_file):
         requirements_file = os.path.join(script_path, requirements_file)
 
-    if not requirements_met(requirements_file):
-        run_pip(f'install -r "{requirements_file}"', "requirements")
-        startup_timer.record("install requirements")
+    if is_amd_gpu():
+        # Use AMD-specific installer with smart caching
+        install_requirements_amd(requirements_file)
+    elif not requirements_met(requirements_file):
+        run_pip(f'install -r "{requirements_file}"', "requirements", timeout=600)
+    startup_timer.record("install requirements")
 
     if not os.path.isfile(requirements_file_for_npu):
         requirements_file_for_npu = os.path.join(script_path, requirements_file_for_npu)
 
     if "torch_npu" in torch_command and not requirements_met(requirements_file_for_npu):
-        run_pip(f'install -r "{requirements_file_for_npu}"', "requirements_for_npu")
+        run_pip(f'install -r "{requirements_file_for_npu}"', "requirements_for_npu", timeout=300)
         startup_timer.record("install requirements_for_npu")
 
+    # Clean up any accidentally installed NVIDIA packages on AMD (only first run)
+    if is_amd_gpu() and not _requirements_checked:
+        cleanup_nvidia_packages()
+
+    print("Running extension installers...")
     if not args.skip_install:
         run_extensions_installers(settings_file=args.ui_settings_file)
 
+    print("Checking for updates...")
     if args.update_check:
         version_check(commit)
         startup_timer.record("check version")
@@ -759,6 +1160,8 @@ def prepare_environment():
     if args.update_all_extensions:
         git_pull_recursive(extensions_dir)
         startup_timer.record("update extensions")
+
+    print("Environment preparation complete.")
 
     if "--exit" in sys.argv:
         print("Exiting because of --exit argument")
