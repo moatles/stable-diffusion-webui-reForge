@@ -44,8 +44,8 @@ class ScriptSeed(scripts.ScriptBuiltinUI):
                 subseed_strength = gr.Slider(label='Variation strength', value=0.0, minimum=0, maximum=1, step=0.01, elem_id=self.elem_id("subseed_strength"))
 
             with gr.Row(elem_id=self.elem_id("seed_resize_from_row")):
-                seed_resize_from_w = gr.Slider(minimum=0, maximum=2048, step=8, label="Resize seed from width", value=0, elem_id=self.elem_id("seed_resize_from_w"))
-                seed_resize_from_h = gr.Slider(minimum=0, maximum=2048, step=8, label="Resize seed from height", value=0, elem_id=self.elem_id("seed_resize_from_h"))
+                seed_resize_from_w = gr.Slider(minimum=0, maximum=4092, step=8, label="Resize seed from width", value=0, elem_id=self.elem_id("seed_resize_from_w"))
+                seed_resize_from_h = gr.Slider(minimum=0, maximum=4092, step=8, label="Resize seed from height", value=0, elem_id=self.elem_id("seed_resize_from_h"))
 
         random_seed.click(fn=None, _js="function(){setRandomSeed('" + self.elem_id("seed") + "')}", show_progress=False, inputs=[], outputs=[])
         random_subseed.click(fn=None, _js="function(){setRandomSeed('" + self.elem_id("subseed") + "')}", show_progress=False, inputs=[], outputs=[])
