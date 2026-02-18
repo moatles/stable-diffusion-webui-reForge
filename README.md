@@ -10,20 +10,5 @@ run "bash webui.sh" with a fresh pull, drop in your models extensions and config
 if invoke is open, you will get a mismatched tensor device error
 
 
-a fresh pull will download generative-models into /repositories
-edit
-
-/repositories/generative-models/sgm/modules/encoders/modules.py at line 165
-```py
-                ):
-                    emb = torch.zeros_like(emb)
-                if out_key in output:
-                    target_device = output[out_key].device
-                    output[out_key] = torch.cat(
-                        (output[out_key], emb.to(target_device)), self.KEY2CATDIM[out_key]
-                    )
-                else:
-                    output[out_key] = emb
-```
-
-This will eliminate another tensor device error
+a fresh pull will download a fork of generative-models into /repositories which fixes a seperate tensor on two device error
+/repositories/generative-models/sgm/modules/encoders/modules.py
