@@ -14,7 +14,7 @@ import importlib.metadata
 import json
 import shlex
 from functools import lru_cache
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 from pathlib import Path
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
@@ -37,6 +37,107 @@ dir_repos = "repositories"
 default_command_live = os.environ.get('WEBUI_LAUNCH_LIVE_OUTPUT') == "1"
 
 os.environ.setdefault('GRADIO_ANALYTICS_ENABLED', 'False')
+
+
+# GPU Detection Cache
+_gpu_info_cache: Optional[dict] = None
+
+
+def detect_gpu() -> dict:
+    """
+    Detect GPU vendor and model.
+    Returns dict with keys: vendor ('amd', 'nvidia', 'intel', 'none'), model, vram_mb
+    """
+    global _gpu_info_cache
+    if _gpu_info_cache is not None:
+        return _gpu_info_cache
+
+    gpu_info = {
+        'vendor': 'none',
+        'model': 'Unknown',
+        'vram_mb': 0,
+        'is_amd': False,
+        'is_nvidia': False,
+    }
+
+    # Try AMD detection first (via rocm-smi or lspci)
+    try:
+        result = subprocess.run(
+            ['rocm-smi', '--showproductname'],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0 and result.stdout:
+            for line in result.stdout.splitlines():
+                if 'card series' in line.lower() or 'gpu' in line.lower():
+                    gpu_info['vendor'] = 'amd'
+                    gpu_info['is_amd'] = True
+                    gpu_info['model'] = line.split(':')[-1].strip() if ':' in line else line.strip()
+                    break
+            if gpu_info['is_amd']:
+                vram_result = subprocess.run(
+                    ['rocm-smi', '--showmeminfo', 'vram'],
+                    capture_output=True, text=True, timeout=5
+                )
+                if vram_result.returncode == 0:
+                    for line in vram_result.stdout.splitlines():
+                        if 'total' in line.lower():
+                            match = re.search(r'(\d+)', line)
+                            if match:
+                                gpu_info['vram_mb'] = int(match.group(1)) // (1024 * 1024)
+                                break
+    except (subprocess.TimeoutExpired, FileNotFoundError, Exception):
+        pass
+
+    # Try AMD detection via lspci if rocm-smi failed
+    if not gpu_info['is_amd']:
+        try:
+            result = subprocess.run(
+                ['lspci'], capture_output=True, text=True, timeout=5
+            )
+            if result.returncode == 0:
+                for line in result.stdout.splitlines():
+                    line_lower = line.lower()
+                    if ('vga' in line_lower or '3d' in line_lower) and ('amd' in line_lower or 'radeon' in line_lower):
+                        gpu_info['vendor'] = 'amd'
+                        gpu_info['is_amd'] = True
+                        gpu_info['model'] = line.split(':')[-1].strip() if ':' in line else line.strip()
+                        break
+        except (subprocess.TimeoutExpired, FileNotFoundError, Exception):
+            pass
+
+    # Try NVIDIA detection if not AMD
+    if not gpu_info['is_amd']:
+        try:
+            result = subprocess.run(
+                ['nvidia-smi', '--query-gpu=name,memory.total', '--format=csv,noheader'],
+                capture_output=True, text=True, timeout=5
+            )
+            if result.returncode == 0 and result.stdout:
+                line = result.stdout.strip().split('\n')[0]
+                parts = line.split(',')
+                gpu_info['vendor'] = 'nvidia'
+                gpu_info['is_nvidia'] = True
+                gpu_info['model'] = parts[0].strip()
+                if len(parts) > 1:
+                    vram_str = parts[1].strip()
+                    match = re.search(r'(\d+)', vram_str)
+                    if match:
+                        gpu_info['vram_mb'] = int(match.group(1))
+        except (subprocess.TimeoutExpired, FileNotFoundError, Exception):
+            pass
+
+    _gpu_info_cache = gpu_info
+    return gpu_info
+
+
+def is_amd_gpu() -> bool:
+    """Check if system has AMD GPU."""
+    return detect_gpu()['is_amd']
+
+
+def is_nvidia_gpu() -> bool:
+    """Check if system has NVIDIA GPU."""
+    return detect_gpu()['is_nvidia']
 
 
 def check_python_version():
@@ -144,6 +245,36 @@ def get_package_version(package):
         return importlib.metadata.version(package)
     except importlib.metadata.PackageNotFoundError:
         return None
+
+
+def compare_versions(v1, v2):
+    """
+    Compare two version strings without requiring packaging module.
+    Returns: -1 if v1 < v2, 0 if v1 == v2, 1 if v1 > v2
+    """
+    def normalize(v):
+        parts = []
+        for part in re.split(r'[.\-_]', v):
+            numeric = re.match(r'^(\d+)', part)
+            if numeric:
+                parts.append(int(numeric.group(1)))
+            else:
+                parts.append(0)
+        return parts
+
+    v1_parts = normalize(v1)
+    v2_parts = normalize(v2)
+
+    max_len = max(len(v1_parts), len(v2_parts))
+    v1_parts.extend([0] * (max_len - len(v1_parts)))
+    v2_parts.extend([0] * (max_len - len(v2_parts)))
+
+    for a, b in zip(v1_parts, v2_parts):
+        if a < b:
+            return -1
+        if a > b:
+            return 1
+    return 0
 
 
 def repo_dir(name):
@@ -362,8 +493,6 @@ def requirements_met(requirements_file):
     Parse a requirements.txt file to determine if all requirements are installed.
     Returns True if so, False if not installed or parsing fails.
     """
-    import packaging.version
-
     try:
         with open(requirements_file, "r", encoding="utf8") as file:
             for line in file:
@@ -381,12 +510,11 @@ def requirements_met(requirements_file):
                 if not version_required:
                     continue
 
-                try:
-                    version_installed = importlib.metadata.version(package)
-                except importlib.metadata.PackageNotFoundError:
+                version_installed = get_package_version(package)
+                if version_installed is None:
                     return False
 
-                if packaging.version.parse(version_required) != packaging.version.parse(version_installed):
+                if compare_versions(version_required, version_installed) != 0:
                     return False
     except FileNotFoundError:
         return False
@@ -397,12 +525,11 @@ def requirements_met(requirements_file):
 def get_cuda_compute_cap():
     """
     Returns float of CUDA Compute Capability using nvidia-smi.
-    Returns 0.0 on error.
-
-    CUDA Compute Capability reference:
-    - https://developer.nvidia.com/cuda-gpus
-    - https://en.wikipedia.org/wiki/CUDA
+    Returns 0.0 on error or if not NVIDIA GPU.
     """
+    if is_amd_gpu():
+        return 0.0
+
     try:
         output = subprocess.check_output(
             ['nvidia-smi', '--query-gpu=compute_cap', '--format=noheader,csv'],
@@ -413,20 +540,8 @@ def get_cuda_compute_cap():
         return 0.0
 
 
-def install_early_dependencies():
-    """
-    Install critical dependencies that must be present before other requirements.
-    These packages are needed for building/installing other packages.
-    """
-    import packaging.version
-
-    clip_package = os.environ.get(
-        'CLIP_PACKAGE',
-        "https://github.com/openai/CLIP/archive/d50d76daa670286dd6cacf3bcd80b5e4823fc8e1.zip"
-    )
-
-    # Check and install setuptools < 70.0.0
-    # Newer versions of setuptools break some package builds
+def install_setuptools():
+    """Install setuptools < 70.0.0 if needed."""
     setuptools_version = get_package_version("setuptools")
     needs_setuptools = False
 
@@ -434,12 +549,9 @@ def install_early_dependencies():
         needs_setuptools = True
         print("setuptools not found, will install")
     else:
-        try:
-            if packaging.version.parse(setuptools_version) >= packaging.version.parse("70.0.0"):
-                needs_setuptools = True
-                print(f"setuptools {setuptools_version} >= 70.0.0, will downgrade")
-        except Exception:
+        if compare_versions(setuptools_version, "70.0.0") >= 0:
             needs_setuptools = True
+            print(f"setuptools {setuptools_version} >= 70.0.0, will downgrade")
 
     if needs_setuptools:
         run(
@@ -450,29 +562,54 @@ def install_early_dependencies():
         )
         startup_timer.record("install setuptools")
 
-    # Check and install CLIP
-    # CLIP requires --no-build-isolation due to its build requirements
-    if not is_installed("clip"):
-        run(
-            f'uv pip install --no-build-isolation {clip_package}',
-            desc="Installing CLIP (required dependency)",
-            errdesc="Couldn't install CLIP",
-            live=True
-        )
-        startup_timer.record("install clip (early)")
+
+def install_clip():
+    """Install CLIP with --no-build-isolation (must be called after torch is installed)."""
+    if is_installed("clip"):
+        return
+
+    clip_package = os.environ.get(
+        'CLIP_PACKAGE',
+        "https://github.com/openai/CLIP/archive/d50d76daa670286dd6cacf3bcd80b5e4823fc8e1.zip"
+    )
+
+    run(
+        f'uv pip install --no-build-isolation --no-deps {clip_package}',
+        desc="Installing CLIP (required dependency)",
+        errdesc="Couldn't install CLIP",
+        live=True
+    )
+    startup_timer.record("install clip")
 
 
 def prepare_environment():
-    torch_index_url = os.environ.get('TORCH_INDEX_URL', "https://download.pytorch.org/whl/cu128")
-    torch_command = os.environ.get(
-        'TORCH_COMMAND',
-        f"uv pip install torch==2.9.0 torchvision --index-url {torch_index_url}"
-    )
+    gpu_info = detect_gpu()
+    print(f"Detected GPU: {gpu_info['vendor'].upper()} - {gpu_info['model']}")
+    if gpu_info['vram_mb'] > 0:
+        print(f"VRAM: {gpu_info['vram_mb']} MB")
+
+    # Set torch command based on GPU vendor
+    if is_amd_gpu():
+        # AMD GPU - use ROCm
+        torch_index_url = os.environ.get('TORCH_INDEX_URL', "https://download.pytorch.org/whl/nightly/rocm6.3")
+        torch_command = os.environ.get(
+            'TORCH_COMMAND',
+            f"uv pip install torch torchvision --index-url {torch_index_url}"
+        )
+        xformers_package = None
+    else:
+        # NVIDIA GPU or fallback - use CUDA
+        torch_index_url = os.environ.get('TORCH_INDEX_URL', "https://download.pytorch.org/whl/cu128")
+        torch_command = os.environ.get(
+            'TORCH_COMMAND',
+            f"uv pip install torch==2.9.0 torchvision --index-url {torch_index_url}"
+        )
+        xformers_package = os.environ.get(
+            'XFORMERS_PACKAGE',
+            'xformers --index-url https://download.pytorch.org/whl/cu128'
+        )
 
     if args.use_ipex:
-        # Using official IPEX release for Linux (AOT build)
-        # Users need to install oneAPI toolkit and activate oneAPI environment manually.
-        # See https://intel.github.io/intel-extension-for-pytorch/index.html#installation
         torch_index_url = os.environ.get(
             'TORCH_INDEX_URL',
             "https://pytorch-extension.intel.com/release-whl/stable/xpu/us/"
@@ -486,10 +623,6 @@ def prepare_environment():
     requirements_file = os.environ.get('REQS_FILE', "requirements_versions.txt")
     requirements_file_for_npu = os.environ.get('REQS_FILE_FOR_NPU', "requirements_npu.txt")
 
-    xformers_package = os.environ.get(
-        'XFORMERS_PACKAGE',
-        'xformers --index-url https://download.pytorch.org/whl/cu128'
-    )
     openclip_package = os.environ.get(
         'OPENCLIP_PACKAGE',
         "https://github.com/mlfoundations/open_clip/archive/bb6e834e9c70d9c27d0dc3ecedeebeaeb1ffad6b.zip"
@@ -539,16 +672,21 @@ def prepare_environment():
     print(f"Version: {tag}")
     print(f"Commit hash: {commit}")
 
-    # Install early dependencies before anything else
-    # These are required for building/installing other packages
+    # Install setuptools first (needed for building packages)
     if not args.skip_install:
-        install_early_dependencies()
+        install_setuptools()
 
+    # Install torch BEFORE clip to ensure correct backend (ROCm vs CUDA)
     if args.reinstall_torch or not is_installed("torch") or not is_installed("torchvision"):
         run(torch_command, "Installing torch and torchvision", "Couldn't install torch", live=True)
         startup_timer.record("install torch")
 
-    if args.use_ipex:
+    # Now install CLIP (after torch, so it uses the correct torch version)
+    if not args.skip_install:
+        install_clip()
+
+    # Skip CUDA test for AMD, IPEX, or if explicitly requested
+    if args.use_ipex or is_amd_gpu():
         args.skip_torch_cuda_test = True
 
     if not args.skip_torch_cuda_test and not check_run_python("import torch; assert torch.cuda.is_available()"):
@@ -558,28 +696,28 @@ def prepare_environment():
         )
     startup_timer.record("torch GPU test")
 
-    # Note: clip is now installed in install_early_dependencies()
-    # This check remains for cases where early install was skipped
-    if not is_installed("clip"):
-        clip_package = os.environ.get(
-            'CLIP_PACKAGE',
-            "https://github.com/openai/CLIP/archive/d50d76daa670286dd6cacf3bcd80b5e4823fc8e1.zip"
-        )
-        run(
-            f'uv pip install --no-build-isolation {clip_package}',
-            desc="Installing clip",
-            errdesc="Couldn't install clip",
-            live=True
-        )
-        startup_timer.record("install clip")
+    # Verify AMD ROCm setup
+    if is_amd_gpu() and not args.skip_torch_cuda_test:
+        if not check_run_python("import torch; assert torch.cuda.is_available() or hasattr(torch.version, 'hip')"):
+            print("Warning: AMD GPU detected but ROCm may not be properly configured")
+            print("Make sure ROCm is installed and HSA_OVERRIDE_GFX_VERSION is set if needed")
 
     if not is_installed("open_clip"):
         run_pip(f"install {openclip_package}", "open_clip")
         startup_timer.record("install open_clip")
 
-    if (not is_installed("xformers") or args.reinstall_xformers) and args.xformers:
-        run_pip(f"install --upgrade --reinstall --no-deps {xformers_package}", "xformers")
-        startup_timer.record("install xformers")
+    # Only install xformers for NVIDIA GPUs
+    if xformers_package is not None and not is_amd_gpu():
+        if (not is_installed("xformers") or args.reinstall_xformers) and args.xformers:
+            run_pip(f"install --upgrade --reinstall --no-deps {xformers_package}", "xformers")
+            startup_timer.record("install xformers")
+    elif is_amd_gpu() and is_installed("xformers"):
+        # Remove xformers if AMD GPU (not compatible)
+        print("AMD GPU detected - removing incompatible xformers...")
+        try:
+            run("uv pip uninstall xformers -y", "Removing xformers", "Couldn't remove xformers", live=True)
+        except Exception:
+            pass
 
     if not is_installed("ngrok") and args.ngrok:
         run_pip("install ngrok", "ngrok")
